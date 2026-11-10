@@ -2,48 +2,137 @@
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && /bin/pwd -P)"
-APP_PATH="${APP_PATH:-$PROJECT_DIR/dist/Type4Me.app}"
-APP_NAME="Type4Me"
-APP_EXECUTABLE="Type4Me"
-APP_ICON_NAME="AppIcon"
-APP_BUNDLE_ID="${APP_BUNDLE_ID:-com.type4me.app}"
-APP_VERSION="${APP_VERSION:-1.9.2}"
+APP_FLAVOR="${APP_FLAVOR:-public}"  # public or personal
+
+case "$APP_FLAVOR" in
+    public)
+        APP_NAME="${APP_NAME:-Type4Me}"
+        APP_BUNDLE_ID="${APP_BUNDLE_ID:-com.type4me.app}"
+        URL_SCHEME="${URL_SCHEME:-type4me}"
+        ;;
+    personal)
+        APP_NAME="${APP_NAME:-Type4Me CtriXin}"
+        APP_BUNDLE_ID="${APP_BUNDLE_ID:-com.ctrixin.type4me}"
+        URL_SCHEME="${URL_SCHEME:-type4me-ctrixin}"
+        ;;
+    *)
+        echo "ERROR: Unknown APP_FLAVOR=$APP_FLAVOR (expected public or personal)"
+        exit 1
+        ;;
+esac
+
+APP_PATH="${APP_PATH:-$PROJECT_DIR/dist/${APP_NAME}.app}"
+APP_EXECUTABLE="${APP_EXECUTABLE:-Type4Me}"
+APP_ICON_NAME="${APP_ICON_NAME:-AppIcon}"
+APP_VERSION="${APP_VERSION:-3.2.0}"
 APP_BUILD="${APP_BUILD:-1}"
 MIN_SYSTEM_VERSION="${MIN_SYSTEM_VERSION:-14.0}"
 VARIANT="${VARIANT:-cloud}"    # cloud or local
 ARCH="${ARCH:-universal}"      # arm64 or universal
-MICROPHONE_USAGE_DESCRIPTION="${MICROPHONE_USAGE_DESCRIPTION:-Type4Me 需要访问麦克风以录制语音并将其转换为文本。}"
-SPEECH_RECOGNITION_USAGE_DESCRIPTION="${SPEECH_RECOGNITION_USAGE_DESCRIPTION:-Type4Me 需要语音识别权限以将你的语音转写为文字。}"
-APPLE_EVENTS_USAGE_DESCRIPTION="${APPLE_EVENTS_USAGE_DESCRIPTION:-Type4Me 需要辅助功能权限来注入转写文字到其他应用}"
+# Base (development region: en) usage descriptions written to Info.plist.
+# Used on English systems and as fallback for other non-localized languages.
+# Can be overridden via environment variables.
+MICROPHONE_USAGE_DESCRIPTION="${MICROPHONE_USAGE_DESCRIPTION:-Type4Me needs microphone access to capture your voice for transcription.}"
+SPEECH_RECOGNITION_USAGE_DESCRIPTION="${SPEECH_RECOGNITION_USAGE_DESCRIPTION:-Type4Me needs speech recognition access to transcribe your voice into text.}"
+APPLE_EVENTS_USAGE_DESCRIPTION="${APPLE_EVENTS_USAGE_DESCRIPTION:-Type4Me needs permission to control other applications to perform automation actions.}"
+
+# Simplified Chinese (zh-Hans) usage descriptions written to zh-Hans.lproj/InfoPlist.strings.
+# Used on Chinese systems. Can be overridden via environment variables.
+ZH_HANS_MICROPHONE_USAGE_DESCRIPTION="${ZH_HANS_MICROPHONE_USAGE_DESCRIPTION:-${MICROPHONE_USAGE_DESCRIPTION_ZH_HANS:-Type4Me 需要访问麦克风以录制语音并将其转换为文本。}}"
+ZH_HANS_SPEECH_RECOGNITION_USAGE_DESCRIPTION="${ZH_HANS_SPEECH_RECOGNITION_USAGE_DESCRIPTION:-${SPEECH_RECOGNITION_USAGE_DESCRIPTION_ZH_HANS:-Type4Me 需要语音识别权限以将你的语音转写为文字。}}"
+ZH_HANS_APPLE_EVENTS_USAGE_DESCRIPTION="${ZH_HANS_APPLE_EVENTS_USAGE_DESCRIPTION:-${APPLE_EVENTS_USAGE_DESCRIPTION_ZH_HANS:-Type4Me 需要控制其他应用程序以执行系统自动化操作。}}"
 INFO_PLIST="$APP_PATH/Contents/Info.plist"
 
-ENTITLEMENTS="$PROJECT_DIR/entitlements.plist"
+ENTITLEMENTS="$PROJECT_DIR/scripts/entitlements.plist"
+
+codesign_file() {
+    local target="$1"
+    shift
+    if [ "$SIGNING_IDENTITY" = "-" ]; then
+        return 0
+    fi
+    codesign --force --options runtime --timestamp --sign "$SIGNING_IDENTITY" "$@" "$target"
+}
+
+codesign_macho_tree() {
+    local root="$1"
+    [ -d "$root" ] || return 0
+    while IFS= read -r f; do
+        if file "$f" | grep -q "Mach-O"; then
+            codesign_file "$f"
+        fi
+    done < <(find "$root" -type f \( -name "*.dylib" -o -name "*.so" -o -perm -111 \))
+}
 
 if [ -n "${CODESIGN_IDENTITY:-}" ]; then
     SIGNING_IDENTITY="$CODESIGN_IDENTITY"
 elif security find-identity -v -p codesigning 2>/dev/null | grep -q "Developer ID Application"; then
     SIGNING_IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)"/\1/')
     echo "Using Developer ID: $SIGNING_IDENTITY"
+elif security find-identity -v -p codesigning 2>/dev/null | grep -q "Apple Development"; then
+    SIGNING_IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null | grep "Apple Development" | head -1 | sed 's/.*"\(.*\)"/\1/')
+    echo "Using Apple Development: $SIGNING_IDENTITY"
 elif security find-identity -v -p codesigning 2>/dev/null | grep -q "Type4Me Dev"; then
     SIGNING_IDENTITY="Type4Me Dev"
 else
     SIGNING_IDENTITY="-"
 fi
 
-if [ "$ARCH" = "arm64" ]; then
-    echo "Building arm64 release..."
-    swift build -c release --package-path "$PROJECT_DIR" --arch arm64 2>&1 | grep -E "Build complete|Build succeeded|error:|warning:" || true
-else
-    echo "Building universal release (arm64 + x86_64)..."
-    swift build -c release --package-path "$PROJECT_DIR" --arch arm64 --arch x86_64 2>&1 | grep -E "Build complete|Build succeeded|error:|warning:" || true
-fi
+BINARY="${BINARY:-}"
+if [ -z "$BINARY" ]; then
+    if [ "${SKIP_BUILD:-0}" != "1" ]; then
+        # SwiftPM's Swift Build backend links with `--sysroot` only, so clang
+        # cannot read the SDK version and stamps LC_BUILD_VERSION with the
+        # deployment target (14.0). AppKit then runs the app in legacy-design
+        # compatibility mode (old traffic lights, window chrome and controls).
+        # Passing `-isysroot` to the link step records the real SDK version.
+        SDK_PATH="$(xcrun --sdk macosx --show-sdk-path)"
+        LINK_SDK_FLAGS=(
+            -Xswiftc -Xclang-linker -Xswiftc -isysroot
+            -Xswiftc -Xclang-linker -Xswiftc "$SDK_PATH"
+        )
+        if [ "$ARCH" = "arm64" ]; then
+            echo "Building arm64 release..."
+            swift build -c release --package-path "$PROJECT_DIR" --arch arm64 "${LINK_SDK_FLAGS[@]}"
+        else
+            echo "Building universal release (arm64 + x86_64)..."
+            swift build -c release --package-path "$PROJECT_DIR" --arch arm64 --arch x86_64 "${LINK_SDK_FLAGS[@]}"
+        fi
+    fi
 
-if [ -f "$PROJECT_DIR/.build/apple/Products/Release/Type4Me" ]; then
-    BINARY="$PROJECT_DIR/.build/apple/Products/Release/Type4Me"
-elif [ -f "$PROJECT_DIR/.build/release/Type4Me" ]; then
-    BINARY="$PROJECT_DIR/.build/release/Type4Me"
-else
-    BINARY="$(find "$PROJECT_DIR/.build" -path '*/release/Type4Me' -type f -not -path '*/x86_64/*' -not -path '*/arm64/*' | head -n 1)"
+    if [ "$ARCH" = "arm64" ]; then
+        candidates=(
+            "$PROJECT_DIR/.build/release/Type4Me"
+            "$PROJECT_DIR/.build/arm64-apple-macosx/release/Type4Me"
+            "$PROJECT_DIR/.build/apple/Products/Release/Type4Me"
+        )
+    else
+        candidates=(
+            "$PROJECT_DIR/.build/apple/Products/Release/Type4Me"
+            "$PROJECT_DIR/.build/release/Type4Me"
+        )
+    fi
+
+    for candidate in "${candidates[@]}"; do
+        if [ -f "$candidate" ]; then
+            archs="$(lipo -archs "$candidate" 2>/dev/null || true)"
+            if [ "$ARCH" = "universal" ]; then
+                if echo "$archs" | grep -q "arm64" && echo "$archs" | grep -q "x86_64"; then
+                    BINARY="$candidate"
+                    break
+                fi
+            else
+                if echo "$archs" | grep -q "$ARCH"; then
+                    BINARY="$candidate"
+                    break
+                fi
+            fi
+        fi
+    done
+
+    if [ -z "$BINARY" ]; then
+        BINARY="$(find "$PROJECT_DIR/.build" -path '*/release/Type4Me' -type f -not -path '*/x86_64/*' -not -path '*/arm64/*' | head -n 1)"
+    fi
 fi
 
 if [ ! -f "$BINARY" ]; then
@@ -54,7 +143,20 @@ fi
 echo "Packaging app bundle at $APP_PATH..."
 mkdir -p "$APP_PATH/Contents/MacOS" "$APP_PATH/Contents/Resources"
 cp "$BINARY" "$APP_PATH/Contents/MacOS/$APP_EXECUTABLE"
-cp "$PROJECT_DIR/Type4Me/Resources/${APP_ICON_NAME}.icns" "$APP_PATH/Contents/Resources/${APP_ICON_NAME}.icns" 2>/dev/null || true
+cp "$PROJECT_DIR/Sources/Type4Me/Resources/${APP_ICON_NAME}.icns" "$APP_PATH/Contents/Resources/${APP_ICON_NAME}.icns" 2>/dev/null || true
+mkdir -p "$APP_PATH/Contents/Resources/Assets"
+cp "$PROJECT_DIR/Sources/Type4Me/Resources/Assets/"*.svg "$APP_PATH/Contents/Resources/Assets/"
+BINARY_DIR="$(dirname "$BINARY")"
+find "$BINARY_DIR" -maxdepth 1 -name "*.bundle" -exec cp -R {} "$APP_PATH/Contents/Resources/" \; 2>/dev/null || true
+
+if [ -f "$PROJECT_DIR/Sources/CppJiebaBridge/marker" ]; then
+    mkdir -p "$APP_PATH/Contents/Resources/Jieba"
+    cp "$PROJECT_DIR/Sources/Type4Me/Resources/Jieba/dict.txt.small" "$APP_PATH/Contents/Resources/Jieba/"
+    cp "$PROJECT_DIR/Sources/Type4Me/Resources/Jieba/hmm_model.utf8" "$APP_PATH/Contents/Resources/Jieba/"
+    cp "$PROJECT_DIR/Sources/Type4Me/Resources/Jieba/user.dict.utf8" "$APP_PATH/Contents/Resources/Jieba/"
+    cp "$PROJECT_DIR/Sources/CppJiebaBridge/CPPJIEBA_LICENSE" "$APP_PATH/Contents/Resources/Jieba/"
+    cp "$PROJECT_DIR/Sources/CppJiebaBridge/JIEBA_LICENSE" "$APP_PATH/Contents/Resources/Jieba/"
+fi
 
 cat >"$INFO_PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -107,7 +209,7 @@ cat >"$INFO_PLIST" <<EOF
             <string>${APP_BUNDLE_ID}</string>
             <key>CFBundleURLSchemes</key>
             <array>
-                <string>type4me</string>
+                <string>${URL_SCHEME}</string>
             </array>
         </dict>
     </array>
@@ -116,7 +218,36 @@ cat >"$INFO_PLIST" <<EOF
 EOF
 
 mkdir -p "$APP_PATH/Contents/Resources/Sounds"
-cp "$PROJECT_DIR/Type4Me/Resources/Sounds/"*.wav "$APP_PATH/Contents/Resources/Sounds/" 2>/dev/null || true
+cp "$PROJECT_DIR/Sources/Type4Me/Resources/Sounds/"*.wav "$APP_PATH/Contents/Resources/Sounds/" 2>/dev/null || true
+
+mkdir -p "$APP_PATH/Contents/Resources/Icons"
+cp "$PROJECT_DIR/Sources/Type4Me/Resources/Icons/"*.png "$APP_PATH/Contents/Resources/Icons/" 2>/dev/null || true
+
+# Localized resources (.lproj directories).
+# Note: en.lproj is intentionally omitted because CFBundleDevelopmentRegion is "en"
+# and base Info.plist provides English strings while respecting MICROPHONE_USAGE_DESCRIPTION etc. overrides.
+# Remove existing en.lproj if present from prior builds to prevent masking Info.plist.
+rm -rf "$APP_PATH/Contents/Resources/en.lproj"
+
+for lproj_dir in "$PROJECT_DIR/Sources/Type4Me/Resources/"*.lproj; do
+    [ -d "$lproj_dir" ] || continue
+    lproj_name="$(basename "$lproj_dir")"
+    [ "$lproj_name" != "en.lproj" ] || continue
+    rm -rf "$APP_PATH/Contents/Resources/$lproj_name"
+    cp -R "$lproj_dir" "$APP_PATH/Contents/Resources/"
+done
+
+# Generate zh-Hans.lproj/InfoPlist.strings with configured/overridden usage descriptions.
+mkdir -p "$APP_PATH/Contents/Resources/zh-Hans.lproj"
+cat >"$APP_PATH/Contents/Resources/zh-Hans.lproj/InfoPlist.strings" <<EOF
+/* Type4Me 权限用途说明（简体中文） */
+
+"NSMicrophoneUsageDescription" = "${ZH_HANS_MICROPHONE_USAGE_DESCRIPTION}";
+
+"NSSpeechRecognitionUsageDescription" = "${ZH_HANS_SPEECH_RECOGNITION_USAGE_DESCRIPTION}";
+
+"NSAppleEventsUsageDescription" = "${ZH_HANS_APPLE_EVENTS_USAGE_DESCRIPTION}";
+EOF
 
 # --- Models and local ASR server (local variant only) ---
 if [ "$VARIANT" = "local" ]; then
@@ -169,10 +300,10 @@ if [ "$VARIANT" = "local" ]; then
     # Build automatically with MLX_METAL_JIT=ON for macOS 14+ compatibility.
     # Placed in Contents/Resources/ (not MacOS/) to avoid codesign treating
     # PyInstaller internals (.dist-info, python3.x dirs) as nested bundles.
-    QWEN3_DIST="$PROJECT_DIR/qwen3-asr-server/dist/qwen3-asr-server"
-    if [ "${SKIP_QWEN3_BUILD:-0}" != "1" ] && [ -f "$PROJECT_DIR/qwen3-asr-server/build.sh" ]; then
+    QWEN3_DIST="$PROJECT_DIR/Sources/qwen3-asr-server/dist/qwen3-asr-server"
+    if [ "${SKIP_QWEN3_BUILD:-0}" != "1" ] && [ -f "$PROJECT_DIR/Sources/qwen3-asr-server/build.sh" ]; then
         echo "Building qwen3-asr-server (MLX JIT mode for macOS 14+ compat)..."
-        bash "$PROJECT_DIR/qwen3-asr-server/build.sh"
+        bash "$PROJECT_DIR/Sources/qwen3-asr-server/build.sh"
     fi
     if [ -d "$QWEN3_DIST" ]; then
         echo "Bundling qwen3-asr-server..."
@@ -186,13 +317,28 @@ WRAPPER
         chmod +x "$APP_PATH/Contents/MacOS/qwen3-asr-server"
         # Remove .dist-info dirs that confuse codesign's bundle detection
         find "$APP_PATH/Contents/Resources/qwen3-asr-server-dist" -type d -name "*.dist-info" -exec rm -rf {} + 2>/dev/null || true
+        # MLX resolves mlx.metallib relative to libmlx.dylib in some frozen
+        # layouts. Keep a copy next to libmlx.dylib to avoid runtime discovery
+        # failures when PyInstaller places it under mlx/lib/.
+        MLX_METALLIB=$(find "$APP_PATH/Contents/Resources/qwen3-asr-server-dist" -name "mlx.metallib" -type f | head -1 || true)
+        MLX_INTERNAL="$APP_PATH/Contents/Resources/qwen3-asr-server-dist/_internal"
+        if [ -n "$MLX_METALLIB" ] && [ -f "$MLX_INTERNAL/libmlx.dylib" ] && [ ! -f "$MLX_INTERNAL/mlx.metallib" ]; then
+            cp "$MLX_METALLIB" "$MLX_INTERNAL/mlx.metallib"
+        fi
         # Keep mlx.metallib in the bundle.  Even in JIT mode (MLX_METAL_JIT=ON)
         # the small (~2-5MB) metallib is required for MLX initialization.
         # JIT mode ensures the metallib uses only core shaders compatible with
         # macOS 14+; additional kernels are compiled from embedded source at
         # runtime for the host's Metal version.
-        find "$APP_PATH/Contents/Resources/qwen3-asr-server-dist" -type f \( -name "*.dylib" -o -name "*.so" -o -name "*.metallib" -o -perm +111 \) \
-            -exec codesign --force --options runtime --timestamp --sign "${SIGNING_IDENTITY}" {} \; 2>/dev/null || true
+        codesign_macho_tree "$APP_PATH/Contents/Resources/qwen3-asr-server-dist"
+        QWEN3_FROZEN_EXE="$APP_PATH/Contents/Resources/qwen3-asr-server-dist/qwen3-asr-server"
+        if [ -f "$QWEN3_FROZEN_EXE" ]; then
+            QWEN3_EXE_SIGN_ARGS=()
+            if [ -f "$ENTITLEMENTS" ]; then
+                QWEN3_EXE_SIGN_ARGS+=(--entitlements "$ENTITLEMENTS")
+            fi
+            codesign_file "$QWEN3_FROZEN_EXE" "${QWEN3_EXE_SIGN_ARGS[@]}"
+        fi
         echo "qwen3-asr-server bundled and signed."
     else
         echo "WARNING: qwen3-asr-server dist not found at $QWEN3_DIST (Qwen3 calibration will be unavailable)"
@@ -200,11 +346,18 @@ WRAPPER
 
     echo "Local variant: all models bundled."
 else
+    rm -rf "$APP_PATH/Contents/Resources/Models" \
+           "$APP_PATH/Contents/Resources/qwen3-asr-server-dist" \
+           "$APP_PATH/Contents/MacOS/qwen3-asr-server"
     echo "Cloud variant: skipping model bundling."
 fi
 
 # Copy third-party licenses
-cp "$PROJECT_DIR/Type4Me/Resources/THIRD_PARTY_LICENSES.txt" "$APP_PATH/Contents/Resources/" 2>/dev/null || true
+cp "$PROJECT_DIR/Sources/Type4Me/Resources/THIRD_PARTY_LICENSES.txt" "$APP_PATH/Contents/Resources/" 2>/dev/null || true
+
+# CloudDocs/Finder can attach provenance or FinderInfo xattrs to copied resources.
+# Developer ID signing rejects those as resource-fork detritus, so scrub before signing.
+xattr -cr "$APP_PATH" 2>/dev/null || true
 
 # Sign the app bundle. Skip if already signed with the same identity to preserve
 # Keychain ACLs and Accessibility TCC records across rebuilds.
@@ -224,11 +377,25 @@ if [ "$NEEDS_SIGN" = "1" ]; then
     find "$APP_PATH/Contents/Frameworks" \
         -type f \( -name "*.dylib" -o -name "*.so" -o -name "*.framework" \) \
         -exec codesign --force --options runtime --timestamp --sign "$SIGNING_IDENTITY" {} \; 2>/dev/null || true
+    codesign_macho_tree "$APP_PATH/Contents/Resources/qwen3-asr-server-dist"
 
     # Sign the wrapper script in Contents/MacOS
     Q3_WRAPPER="$APP_PATH/Contents/MacOS/qwen3-asr-server"
     if [ -f "$Q3_WRAPPER" ]; then
-        codesign --force --options runtime --timestamp --sign "$SIGNING_IDENTITY" "$Q3_WRAPPER"
+        Q3_WRAPPER_SIGN_ARGS=()
+        if [ -f "$ENTITLEMENTS" ]; then
+            Q3_WRAPPER_SIGN_ARGS+=(--entitlements "$ENTITLEMENTS")
+        fi
+        codesign_file "$Q3_WRAPPER" "${Q3_WRAPPER_SIGN_ARGS[@]}"
+    fi
+
+    Q3_FROZEN_EXE="$APP_PATH/Contents/Resources/qwen3-asr-server-dist/qwen3-asr-server"
+    if [ -f "$Q3_FROZEN_EXE" ]; then
+        Q3_FROZEN_SIGN_ARGS=()
+        if [ -f "$ENTITLEMENTS" ]; then
+            Q3_FROZEN_SIGN_ARGS+=(--entitlements "$ENTITLEMENTS")
+        fi
+        codesign_file "$Q3_FROZEN_EXE" "${Q3_FROZEN_SIGN_ARGS[@]}"
     fi
 
     # Sign the main app bundle with hardened runtime + entitlements
@@ -240,7 +407,7 @@ if [ "$NEEDS_SIGN" = "1" ]; then
     codesign --verify --strict "$APP_PATH" && echo "Signature verified." || { echo "ERROR: Signature verification failed"; exit 1; }
 fi
 
-echo "Variant: $VARIANT | Arch: $ARCH"
+echo "Flavor: $APP_FLAVOR | Variant: $VARIANT | Arch: $ARCH"
 
 # Remove quarantine flag that macOS adds to downloaded apps.
 # This flag can silently prevent Accessibility permission from working.

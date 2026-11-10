@@ -1,6 +1,5 @@
 # Build
 .build/
-AECTest/.build/
 dist/
 *.dmg
 
@@ -12,10 +11,17 @@ xcuserdata/
 .vscode/
 .claude/
 
+.omp/
+# Local agent context
+.ai/
+.devlead/
+.context/
+
 # macOS
 .DS_Store
 
 # Secrets
+iOS/Signing.local.xcconfig
 .env
 .env.local
 credentials.json
@@ -29,22 +35,36 @@ Frameworks/
 .build-sherpa/
 .worktrees/
 
-# Python build artifacts
+# Python build artifacts & venvs
 __pycache__/
 *.pyc
-sensevoice-server/build/
-sensevoice-server/dist/
-qwen3-asr-server/build/
-qwen3-asr-server/dist/
-qwen3-asr-server/.venv/
-sensevoice-server/.venv/
+*.pyo
+.pytest_cache/
+*.egg-info/
+.coverage
+.mypy_cache/
+Sources/qwen3-asr-server/build/
+Sources/qwen3-asr-server/dist/
+Sources/qwen3-asr-server/.venv/
 
 # Large model files
-sensevoice-server/models/
+Sources/qwen3-asr-server/models/
+
+# Binaries & Dynamic Libraries
+*.dylib
+*.so
 
 # Windows (removed, macOS-only project)
 windows/
 
-# Test artifacts
+# Test & Benchmark artifacts
 test-audio/
 test*.txt
+scripts/benchmark_results.json
+scripts/llm_quality_report.html
+scripts/llm_quality_results*.json
+Tests/IntelliSenseEval/.build/
+Tests/IntelliSenseEval/.swiftpm/
+Tests/IntelliSenseEval/eval-config.json
+Tests/IntelliSenseEval/Runs/
+Tests/IntelliSenseEval/Cache/
