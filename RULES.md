@@ -4,7 +4,7 @@
 
 - Root `AGENTS.md`, `RULES.md`, and `MEMORY.md` are the only standard agent-facing entry files.
 - Do not recreate `CLAUDE.md`, `Agent.md`, `Rules.md`, `Memory.md`, or lowercase memory files; migrate useful content into the standard files instead.
-- `MEMORY.md` should stay progressive: top policy, current facts, latest entries, then older migrated history.
+- `MEMORY.md` 只保留目前事實、有效決定、待接事項與歷史連結；改寫原條目，經過寫入 docs/memory，不逐輪追加。
 - Long logs, generated output, and bulky evidence should not be pasted into the root memory; store them as project artifacts and link from memory.
 
 ## Git Rules
